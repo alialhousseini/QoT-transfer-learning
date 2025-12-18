@@ -1,0 +1,3 @@
+pipeline,roc_auc,accuracy,n_train,n_test,n_features_out
+standard,0.9996606354834489,0.9912,40000,10000,244
+minmax,0.9996538036376015,0.9912,40000,10000,244

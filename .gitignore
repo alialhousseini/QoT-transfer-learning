@@ -1,0 +1,11 @@
+cleaned_lightpath_dataset.csv
+cleaned_lightpath_dataset_2.csv
+cleaned_lightpath_target.csv
+cleaned_lightpath_dataset_2_target.csv
+cleaned_lightpath_dataset_2.nc
+cleaned_lightpath_dataset.nc
+lightpath_dataset.nc
+lightpath_dataset_2.nc
+lightpath_dataset*.nc
+__pycache__/
+*.pyc

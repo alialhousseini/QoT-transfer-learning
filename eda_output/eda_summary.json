@@ -1,0 +1,136 @@
+{
+  "dataset": {
+    "path": "cleaned_lightpath_dataset.csv",
+    "total_samples": 835269,
+    "n_features": 32,
+    "n_metrics": 1,
+    "feature_names": [
+      "path_len",
+      "avg_link_len",
+      "min_link_len",
+      "max_link_len",
+      "num_links",
+      "num_spans",
+      "freq",
+      "mod_order",
+      "lp_linerate",
+      "conn_linerate",
+      "src_degree",
+      "dst_degree",
+      "sum_link_occ",
+      "min_link_occ",
+      "max_link_occ",
+      "avg_link_occ",
+      "std_link_occ",
+      "max_ber",
+      "min_ber",
+      "avg_ber",
+      "min_mod_order_left",
+      "max_mod_order_left",
+      "min_mod_order_right",
+      "max_mod_order_right",
+      "min_lp_linerate_left",
+      "max_lp_linerate_left",
+      "min_lp_linerate_right",
+      "max_lp_linerate_right",
+      "min_ber_left",
+      "max_ber_left",
+      "min_ber_right",
+      "max_ber_right"
+    ],
+    "metric_names": [
+      "class"
+    ],
+    "analyzed_rows": 835269,
+    "analyzed_fraction": 1.0,
+    "pandas_data_mb": 203.92322158813477,
+    "pandas_target_mb": 6.372722625732422
+  },
+  "discrete_columns": [
+    "path_len",
+    "min_link_len",
+    "max_link_len",
+    "num_links",
+    "num_spans",
+    "mod_order",
+    "lp_linerate",
+    "conn_linerate",
+    "src_degree",
+    "dst_degree",
+    "min_link_occ",
+    "max_link_occ",
+    "min_mod_order_left",
+    "max_mod_order_left",
+    "min_mod_order_right",
+    "max_mod_order_right",
+    "min_lp_linerate_left",
+    "max_lp_linerate_left",
+    "min_lp_linerate_right",
+    "max_lp_linerate_right"
+  ],
+  "missing_data_top": {
+    "path_len": 0,
+    "avg_link_len": 0,
+    "min_ber_right": 0,
+    "max_ber_left": 0,
+    "min_ber_left": 0,
+    "max_lp_linerate_right": 0,
+    "min_lp_linerate_right": 0,
+    "max_lp_linerate_left": 0,
+    "min_lp_linerate_left": 0,
+    "max_mod_order_right": 0,
+    "min_mod_order_right": 0,
+    "max_mod_order_left": 0,
+    "min_mod_order_left": 0,
+    "avg_ber": 0,
+    "min_ber": 0,
+    "max_ber": 0,
+    "std_link_occ": 0,
+    "avg_link_occ": 0,
+    "max_link_occ": 0,
+    "min_link_occ": 0
+  },
+  "missing_target_top": {
+    "class": 0
+  },
+  "checks": {
+    "avg_link_len_outside_minmax": {
+      "count": 0.0,
+      "pct": 0.0
+    },
+    "path_len_inconsistent_num_links_avg_link_len": {
+      "count": 0.0,
+      "pct": 0.0
+    },
+    "num_spans_leq_num_links": {
+      "count": 0.0,
+      "pct": 0.0
+    },
+    "avg_ber_outside_minmax": {
+      "count": 0.0,
+      "pct": 0.0
+    },
+    "sum_link_occ_inconsistent_avg_link_occ_num_links": {
+      "count": 0.0,
+      "pct": 0.0
+    },
+    "freq_off_inferred_grid_tol": {
+      "count": 0.0,
+      "pct": 0.0
+    },
+    "class_nan": {
+      "count": 0.0,
+      "pct": 0.0
+    },
+    "class_non_binary": {
+      "count": 0.0,
+      "pct": 0.0
+    }
+  },
+  "check_meta": {
+    "freq_grid_inferred_spacing": 0.037499999999994316,
+    "freq_grid_inferred_anchor": 192.2,
+    "freq_grid_inferred_tol": 3.749999999999432e-05
+  },
+  "corr_heatmap": "eda_output/figures/corr_heatmap_features.png"
+}
