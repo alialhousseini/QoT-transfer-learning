@@ -1,5 +1,6 @@
 cleaned_lightpath_dataset.csv
 cleaned_lightpath_dataset_2.csv
+cleaned_lightpath_dataset_with_flags.csv
 cleaned_lightpath_target.csv
 cleaned_lightpath_target_2.csv
 cleaned_lightpath_dataset_2_target.csv
@@ -8,5 +9,7 @@ cleaned_lightpath_dataset.nc
 lightpath_dataset.nc
 lightpath_dataset_2.nc
 lightpath_dataset*.nc
+processed/
+cleaned_lightpath_dataset_*_*.npz
 __pycache__/
 *.pyc
