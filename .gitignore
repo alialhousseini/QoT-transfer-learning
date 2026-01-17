@@ -13,3 +13,5 @@ processed/
 cleaned_lightpath_dataset_*_*.npz
 __pycache__/
 *.pyc
+datasets/
+datasets/*.csv
