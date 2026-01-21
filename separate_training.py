@@ -38,13 +38,15 @@ import json
 import math
 import random
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+# Import torch before numpy/pandas to avoid DLL initialization issues on Windows.
+import torch
 import numpy as np
 import pandas as pd
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
@@ -411,6 +413,20 @@ def parse_json_dict(value) -> Dict:
     return json.loads(value)
 
 
+def get_trainable_params(module) -> List[nn.Parameter]:
+    if module is None or not hasattr(module, "parameters"):
+        return []
+    return [param for param in module.parameters() if param.requires_grad]
+
+
+def move_module_to_device(module, device: torch.device):
+    if module is None:
+        return None
+    if hasattr(module, "to"):
+        return module.to(device)
+    return module
+
+
 def resolve_pml_component(spec, module):
     if isinstance(spec, dict):
         name = spec.get("name")
@@ -495,15 +511,19 @@ def evaluate_contrastive(
     use_amp: bool,
 ) -> float:
     model.eval()
+    if hasattr(loss_fn, "eval"):
+        loss_fn.eval()
+    if miner is not None and hasattr(miner, "eval"):
+        miner.eval()
     total_loss = 0.0
     total = 0
-    autocast = torch.cuda.amp.autocast
+    autocast = torch.amp.autocast
     with torch.no_grad():
         for cat_ids, num_feats, labels in loader:
             cat_ids = cat_ids.to(device)
             num_feats = num_feats.to(device)
             labels = labels.to(device)
-            with autocast(enabled=use_amp):
+            with autocast(device_type=device.type, enabled=use_amp):
                 _, _, metric, _ = model(cat_ids, num_feats)
                 if miner is not None:
                     pairs = miner(metric, labels)
@@ -527,13 +547,13 @@ def evaluate_classifier(
     total = 0
     probs: List[np.ndarray] = []
     labels_all: List[np.ndarray] = []
-    autocast = torch.cuda.amp.autocast
+    autocast = torch.amp.autocast
     with torch.no_grad():
         for cat_ids, num_feats, labels in loader:
             cat_ids = cat_ids.to(device)
             num_feats = num_feats.to(device)
             labels = labels.to(device)
-            with autocast(enabled=use_amp):
+            with autocast(device_type=device.type, enabled=use_amp):
                 _, _, _, logits = model(cat_ids, num_feats)
                 loss = ce_loss(logits, labels)
             total_loss += loss.item() * len(labels)
@@ -560,28 +580,36 @@ def train_contrastive(
     epochs: int,
     use_amp: bool,
     patience: int,
+    normalize_loss_by_batch: bool,
 ) -> Dict[str, float]:
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(enabled=use_amp)
     best_state = None
     best_val = float("inf")
     patience_left = patience
 
     for epoch in range(epochs):
         model.train()
+        if hasattr(loss_fn, "train"):
+            loss_fn.train()
+        if miner is not None and hasattr(miner, "train"):
+            miner.train()
         total_loss = 0.0
         total = 0
         for cat_ids, num_feats, labels in train_loader:
             cat_ids = cat_ids.to(device)
             num_feats = num_feats.to(device)
             labels = labels.to(device)
+            batch_size = labels.size(0)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 _, _, metric, _ = model(cat_ids, num_feats)
                 if miner is not None:
                     pairs = miner(metric, labels)
                     loss = loss_fn(metric, labels, pairs)
                 else:
                     loss = loss_fn(metric, labels)
+                if normalize_loss_by_batch:
+                    loss = loss / max(batch_size, 1)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -622,7 +650,7 @@ def train_classifier(
     monitor_metric: str,
     finetune_backbone: bool,
 ) -> Dict[str, float]:
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(enabled=use_amp)
     ce_loss = nn.CrossEntropyLoss()
     best_state = None
     best_score = -float("inf")
@@ -644,7 +672,7 @@ def train_classifier(
             num_feats = num_feats.to(device)
             labels = labels.to(device)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 _, _, _, logits = model(cat_ids, num_feats)
                 loss = ce_loss(logits, labels)
             scaler.scale(loss).backward()
@@ -690,8 +718,9 @@ def train_joint(
     monitor_metric: str,
     alpha: float,
     beta: float,
+    normalize_loss_by_batch: bool,
 ) -> Dict[str, float]:
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(enabled=use_amp)
     ce_loss = nn.CrossEntropyLoss()
     best_state = None
     best_score = -float("inf")
@@ -699,20 +728,27 @@ def train_joint(
 
     for epoch in range(epochs):
         model.train()
+        if hasattr(loss_fn, "train"):
+            loss_fn.train()
+        if miner is not None and hasattr(miner, "train"):
+            miner.train()
         total_loss = 0.0
         total = 0
         for cat_ids, num_feats, labels in train_loader:
             cat_ids = cat_ids.to(device)
             num_feats = num_feats.to(device)
             labels = labels.to(device)
+            batch_size = labels.size(0)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 _, _, metric, logits = model(cat_ids, num_feats)
                 if miner is not None:
                     pairs = miner(metric, labels)
                     cont_loss = loss_fn(metric, labels, pairs)
                 else:
                     cont_loss = loss_fn(metric, labels)
+                if normalize_loss_by_batch:
+                    cont_loss = cont_loss / max(batch_size, 1)
                 cls_loss = ce_loss(logits, labels)
                 loss = alpha * cont_loss + beta * cls_loss
             scaler.scale(loss).backward()
@@ -913,20 +949,27 @@ def run_experiment(args: argparse.Namespace, save_outputs: bool) -> Dict[str, Di
         else:
             metric_dim = args.proj_dim
 
-    loss_fn = build_pml_loss(
-        loss_name=args.loss_name,
-        loss_params=args.loss_params,
-        embedding_dim=metric_dim,
-        num_classes=args.num_classes,
+    loss_fn = move_module_to_device(
+        build_pml_loss(
+            loss_name=args.loss_name,
+            loss_params=args.loss_params,
+            embedding_dim=metric_dim,
+            num_classes=args.num_classes,
+        ),
+        device,
     )
-    miner = build_pml_miner(args.miner_name, args.miner_params)
+    miner = move_module_to_device(build_pml_miner(args.miner_name, args.miner_params), device)
+    loss_params = get_trainable_params(loss_fn)
 
     results: Dict[str, Dict] = {"train": {}, "val": {}, "test": {}, "eval": {}}
 
     if args.mode == "separate":
+        contrastive_params = list(model.backbone.parameters())
+        if model.projection is not None:
+            contrastive_params += list(model.projection.parameters())
+        contrastive_params += loss_params
         optimizer = torch.optim.AdamW(
-            list(model.backbone.parameters())
-            + ([] if model.projection is None else list(model.projection.parameters())),
+            contrastive_params,
             lr=args.lr,
             weight_decay=args.weight_decay,
         )
@@ -941,6 +984,7 @@ def run_experiment(args: argparse.Namespace, save_outputs: bool) -> Dict[str, Di
             args.contrastive_epochs,
             use_amp,
             args.patience,
+            args.normalize_loss_by_batch,
         )
         if save_outputs:
             torch.save(model.state_dict(), args.output_dir / f"{args.run_name}_contrastive.pt")
@@ -966,8 +1010,9 @@ def run_experiment(args: argparse.Namespace, save_outputs: bool) -> Dict[str, Di
         if save_outputs:
             torch.save(model.state_dict(), args.output_dir / f"{args.run_name}_classifier.pt")
     else:
+        joint_params = list(model.parameters()) + loss_params
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            joint_params,
             lr=args.lr,
             weight_decay=args.weight_decay,
         )
@@ -985,6 +1030,7 @@ def run_experiment(args: argparse.Namespace, save_outputs: bool) -> Dict[str, Di
             args.monitor_metric,
             args.loss_alpha,
             args.loss_beta,
+            args.normalize_loss_by_batch,
         )
         if save_outputs:
             torch.save(model.state_dict(), args.output_dir / f"{args.run_name}_joint.pt")
@@ -1056,6 +1102,7 @@ def run_tuning(args: argparse.Namespace) -> None:
     metric = args.tune_metric
     best_score = -float("inf")
     best_params = None
+    failed_trials: List[Tuple[int, Dict[str, object], str]] = []
 
     if args.tune_method == "grid":
         combos = list(grid_from_space(space))
@@ -1070,7 +1117,14 @@ def run_tuning(args: argparse.Namespace) -> None:
             trial_args.classifier_epochs = args.tune_epochs
         trial_args.run_name = f"{args.run_name}_trial{idx}"
         print(f"Trial {idx}/{len(combos)} params={params}")
-        results = run_experiment(trial_args, save_outputs=False)
+        try:
+            results = run_experiment(trial_args, save_outputs=False)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            failed_trials.append((idx, params, err))
+            print(f"Trial {idx} failed; skipping. Error: {err}")
+            print(traceback.format_exc())
+            continue
         val_metrics = results.get("val") or results.get("test", {})
         score = val_metrics.get(metric, float("nan"))
         print(f"Trial {idx} {metric}={score}")
@@ -1079,6 +1133,10 @@ def run_tuning(args: argparse.Namespace) -> None:
             best_params = params
 
     print(f"Best {metric}={best_score} params={best_params}")
+    if failed_trials:
+        print(f"Skipped {len(failed_trials)} failed trials.")
+        for idx, params, err in failed_trials:
+            print(f"  Trial {idx} params={params} error={err}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1132,6 +1190,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--miner-params", default="")
     parser.add_argument("--loss-alpha", type=float, default=0.5)
     parser.add_argument("--loss-beta", type=float, default=0.5)
+    parser.add_argument("--normalize-loss-by-batch", action="store_true")
 
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--contrastive-epochs", type=int, default=20)

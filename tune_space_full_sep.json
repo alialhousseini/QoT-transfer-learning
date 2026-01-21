@@ -1,5 +1,5 @@
 {
-  "mode": ["joint"],
+  "mode": ["separate"],
   "data1": ["datasets/cleaned_lightpath_dataset.csv"],
   "target1": ["datasets/cleaned_lightpath_target.csv"],
   "target_col": ["class"],
