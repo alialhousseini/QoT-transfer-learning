@@ -46,7 +46,7 @@
   "save_dir": ["runs"],
   "run_name": [""],
   "tune": [true],
-  "tune_space": ["tune_space_full.json"],
+  "tune_space": ["tune_space_full_sep.json"],
   "tune_trials": [10],
   "tune_method": ["random"],
   "tune_metric": ["f1"],
