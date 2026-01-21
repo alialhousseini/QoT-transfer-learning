@@ -2,8 +2,8 @@
 End-to-end contrastive + classification training for the QoT tabular data.
 
 Pipeline blocks:
-1) Data prep: sampler builds M+N mini-batches (random, class_balanced, m_per_class).
-2) Backbone: tabular encoder -> latent z (embedding_dim).
+1) Data prep: numeric-only features, sampler builds M+N mini-batches.
+2) Backbone: numeric MLP encoder -> latent z (embedding_dim).
 3) Mining + contrastive loss: PML miners/losses on the batch embedding.
 4) Classification head: predicts class from z (cross-entropy).
 
@@ -14,10 +14,10 @@ Supports:
 
 Example:
   python separate_training.py --mode joint \
-    --data1 cleaned_lightpath_dataset.csv --target1 cleaned_lightpath_target.csv \
+    --data1 datasets/cleaned_lightpath_dataset.csv --target1 datasets/cleaned_lightpath_target.csv \
     --loss-name TripletMarginLoss --miner-name BatchHardMiner \
     --sampler m_per_class --m-per-class 64 \
-    --eval data2:cleaned_lightpath_dataset2.csv:cleaned_lightpath_target_2.csv
+    --eval data2:datasets/cleaned_lightpath_dataset_2.csv:datasets/cleaned_lightpath_target_2.csv
 
 Search space JSON example:
 {
@@ -58,19 +58,13 @@ from sklearn.metrics import (
     average_precision_score,
     roc_auc_score,
 )
-
-try:
-    from lightpath_nn import AVAIL_GROUPS, NUMERIC_COLS, CAT_COLS
-except Exception as exc:  # pragma: no cover - fails fast if project layout changes
-    raise ImportError("Missing lightpath_nn.py with column definitions.") from exc
+ 
 
 
 @dataclass
 class PreprocessConfig:
     num_scaler: str = "none"           # "none", "standard", "minmax"
-    cat_encoder: str = "embedding"     # "embedding", "onehot"
     impute_strategy: str = "median"    # "median", "zero"
-    add_availability_flags: bool = True
 
 
 @dataclass
@@ -88,48 +82,24 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def add_availability_flags(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    df = df.copy()
-    flag_cols: List[str] = []
-    for group_name, cols in AVAIL_GROUPS.items():
-        flag_col = f"{group_name}_avail"
-        df[flag_col] = (df[cols].ne(0).any(axis=1)).astype("int8")
-        flag_cols.append(flag_col)
-        for col in cols:
-            df.loc[df[col] == 0, col] = np.nan
-    return df, flag_cols
-
-
-def _make_onehot_encoder():
-    from sklearn.preprocessing import OneHotEncoder
-
-    try:
-        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-    except TypeError:
-        return OneHotEncoder(handle_unknown="ignore", sparse=False)
-
-
 class TabularPreprocessor:
     def __init__(
         self,
         cfg: PreprocessConfig,
-        numeric_cols: Sequence[str],
-        cat_cols: Sequence[str],
+        numeric_cols: Optional[Sequence[str]] = None,
+        drop_cols: Optional[Sequence[str]] = None,
     ) -> None:
         self.cfg = cfg
-        self.numeric_cols = list(numeric_cols)
-        self.cat_cols = list(cat_cols)
-        self.flag_cols: List[str] = []
+        self.numeric_cols = list(numeric_cols) if numeric_cols else []
+        self.drop_cols = list(drop_cols) if drop_cols else []
         self.num_impute: Optional[pd.Series] = None
         self.num_scale: Optional[pd.Series] = None
         self.num_shift: Optional[pd.Series] = None
-        self.cat_maps: Dict[str, Dict[str, int]] = {}
         self.cat_cardinalities: List[int] = []
-        self.onehot_encoder = None
         self.fitted = False
 
     def _check_columns(self, df: pd.DataFrame) -> None:
-        expected = set(self.numeric_cols) | set(self.cat_cols) | set(self.flag_cols)
+        expected = set(self.numeric_cols)
         missing = expected.difference(df.columns)
         if missing:
             missing_list = ", ".join(sorted(missing))
@@ -137,15 +107,16 @@ class TabularPreprocessor:
 
     def fit(self, df: pd.DataFrame) -> "TabularPreprocessor":
         df = df.copy()
-        if self.cfg.add_availability_flags:
-            df, self.flag_cols = add_availability_flags(df)
-        else:
-            self.flag_cols = []
-
-        self.numeric_cols = list(self.numeric_cols) + list(self.flag_cols)
+        if self.drop_cols:
+            df = df.drop(columns=self.drop_cols, errors="ignore")
+        if not self.numeric_cols:
+            self.numeric_cols = list(df.columns)
         self._check_columns(df)
 
-        num_df = df[self.numeric_cols].copy()
+        num_df = df[self.numeric_cols].apply(pd.to_numeric, errors="coerce")
+        if num_df.isna().any().any():
+            nan_count = int(num_df.isna().sum().sum())
+            print(f"Warning: {nan_count} missing/non-numeric values detected; imputation applied.")
         if self.cfg.impute_strategy == "median":
             self.num_impute = num_df.median()
         elif self.cfg.impute_strategy == "zero":
@@ -166,24 +137,7 @@ class TabularPreprocessor:
         else:
             raise ValueError(f"Unsupported num_scaler: {self.cfg.num_scaler}")
 
-        if self.cfg.cat_encoder == "embedding":
-            cat_df = df[self.cat_cols].fillna("missing").astype(str)
-            self.cat_maps = {}
-            self.cat_cardinalities = []
-            for col in self.cat_cols:
-                categories = sorted(cat_df[col].unique().tolist())
-                self.cat_maps[col] = {val: idx for idx, val in enumerate(categories)}
-                self.cat_cardinalities.append(len(categories) + 1)
-            self.onehot_encoder = None
-        elif self.cfg.cat_encoder == "onehot":
-            cat_df = df[self.cat_cols].fillna("missing").astype(str)
-            self.onehot_encoder = _make_onehot_encoder()
-            self.onehot_encoder.fit(cat_df)
-            self.cat_maps = {}
-            self.cat_cardinalities = []
-        else:
-            raise ValueError(f"Unsupported cat_encoder: {self.cfg.cat_encoder}")
-
+        self.cat_cardinalities = []
         self.fitted = True
         return self
 
@@ -192,12 +146,11 @@ class TabularPreprocessor:
             raise RuntimeError("Preprocessor must be fitted before transform.")
 
         df = df.copy()
-        if self.cfg.add_availability_flags:
-            df, _ = add_availability_flags(df)
-
+        if self.drop_cols:
+            df = df.drop(columns=self.drop_cols, errors="ignore")
         self._check_columns(df)
 
-        num_df = df[self.numeric_cols].copy()
+        num_df = df[self.numeric_cols].apply(pd.to_numeric, errors="coerce")
         num_df = num_df.fillna(self.num_impute)
         if self.cfg.num_scaler == "standard":
             num_df = (num_df - self.num_shift) / self.num_scale
@@ -205,26 +158,8 @@ class TabularPreprocessor:
             num_df = (num_df - self.num_shift) / self.num_scale
 
         num_matrix = num_df.to_numpy(dtype=np.float32)
-
-        if self.cfg.cat_encoder == "embedding":
-            cat_df = df[self.cat_cols].fillna("missing").astype(str)
-            cat_matrix = np.zeros((len(df), len(self.cat_cols)), dtype=np.int64)
-            for i, col in enumerate(self.cat_cols):
-                mapping = self.cat_maps[col]
-                unknown_idx = self.cat_cardinalities[i] - 1
-                mapped = cat_df[col].map(mapping).fillna(unknown_idx).astype(np.int64)
-                cat_matrix[:, i] = mapped.to_numpy()
-            return cat_matrix, num_matrix
-
-        if self.cfg.cat_encoder == "onehot":
-            cat_df = df[self.cat_cols].fillna("missing").astype(str)
-            onehot = self.onehot_encoder.transform(cat_df).astype(np.float32)
-            if onehot.shape[1] > 0:
-                num_matrix = np.concatenate([num_matrix, onehot], axis=1)
-            cat_matrix = np.empty((len(df), 0), dtype=np.int64)
-            return cat_matrix, num_matrix
-
-        raise ValueError(f"Unsupported cat_encoder: {self.cfg.cat_encoder}")
+        cat_matrix = np.empty((len(df), 0), dtype=np.int64)
+        return cat_matrix, num_matrix
 
 
 class TabularDataset(Dataset):
@@ -260,32 +195,6 @@ def load_raw_data(
         y = y.reset_index(drop=True)
     return df, y
 
-
-def mix_with_data2(
-    df1: pd.DataFrame,
-    y1: pd.Series,
-    df2: Optional[pd.DataFrame],
-    y2: Optional[pd.Series],
-    mix_percent: float,
-    mix_base: str,
-    seed: int,
-) -> Tuple[pd.DataFrame, pd.Series]:
-    if df2 is None or y2 is None or mix_percent <= 0:
-        return df1, y1
-
-    if mix_base == "data2":
-        sample_size = int(len(df2) * mix_percent)
-    elif mix_base == "data1":
-        sample_size = int(len(df1) * mix_percent)
-    else:
-        raise ValueError("mix_base must be 'data1' or 'data2'.")
-
-    sample_size = max(1, min(sample_size, len(df2)))
-    df2_sample = df2.sample(n=sample_size, random_state=seed)
-    y2_sample = y2.loc[df2_sample.index]
-    df_combined = pd.concat([df1, df2_sample], ignore_index=True)
-    y_combined = pd.concat([y1, y2_sample], ignore_index=True)
-    return df_combined, y_combined
 
 
 def split_indices(
@@ -400,36 +309,6 @@ def build_mlp(input_dim: int, hidden_dims: Sequence[int], output_dim: int, dropo
     return nn.Sequential(*layers)
 
 
-class CatMLPBackbone(nn.Module):
-    def __init__(
-        self,
-        cat_cardinalities: Sequence[int],
-        numeric_dim: int,
-        cat_embed_dim: int,
-        hidden_dims: Sequence[int],
-        embedding_dim: int,
-        dropout: float,
-    ) -> None:
-        super().__init__()
-        self.embeddings = nn.ModuleList(
-            [nn.Embedding(cardinality, cat_embed_dim) for cardinality in cat_cardinalities]
-        )
-        self.num_norm = nn.LayerNorm(numeric_dim) if numeric_dim > 0 else None
-        input_dim = len(cat_cardinalities) * cat_embed_dim + numeric_dim
-        self.mlp = build_mlp(input_dim, hidden_dims, embedding_dim, dropout)
-
-    def forward(self, cat_ids: torch.Tensor, num_feats: torch.Tensor) -> torch.Tensor:
-        cat_tokens = [emb(cat_ids[:, i]) for i, emb in enumerate(self.embeddings)]
-        cat_flat = torch.cat(cat_tokens, dim=1) if cat_tokens else None
-        if self.num_norm is not None:
-            num_feats = self.num_norm(num_feats)
-        if cat_flat is None:
-            x = num_feats
-        else:
-            x = torch.cat([cat_flat, num_feats], dim=1)
-        return self.mlp(x)
-
-
 class DenseMLPBackbone(nn.Module):
     def __init__(
         self,
@@ -446,54 +325,6 @@ class DenseMLPBackbone(nn.Module):
         if self.num_norm is not None:
             num_feats = self.num_norm(num_feats)
         return self.mlp(num_feats)
-
-
-class CatTransformerBackbone(nn.Module):
-    def __init__(
-        self,
-        cat_cardinalities: Sequence[int],
-        numeric_dim: int,
-        d_model: int,
-        nhead: int,
-        num_layers: int,
-        hidden_dims: Sequence[int],
-        embedding_dim: int,
-        dropout: float,
-        flatten: bool = True,
-    ) -> None:
-        super().__init__()
-        self.embeddings = nn.ModuleList(
-            [nn.Embedding(cardinality, d_model) for cardinality in cat_cardinalities]
-        )
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=max(2 * d_model, 64),
-            dropout=dropout,
-            batch_first=True,
-            activation="gelu",
-            norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.flatten = flatten
-        self.num_norm = nn.LayerNorm(numeric_dim) if numeric_dim > 0 else None
-        transformer_out_dim = len(cat_cardinalities) * d_model if flatten else d_model
-        input_dim = transformer_out_dim + numeric_dim
-        self.mlp = build_mlp(input_dim, hidden_dims, embedding_dim, dropout)
-
-    def forward(self, cat_ids: torch.Tensor, num_feats: torch.Tensor) -> torch.Tensor:
-        cat_tokens = torch.stack(
-            [emb(cat_ids[:, i]) for i, emb in enumerate(self.embeddings)], dim=1
-        )
-        ctx = self.transformer(cat_tokens)
-        if self.flatten:
-            ctx = ctx.flatten(start_dim=1)
-        else:
-            ctx = ctx.mean(dim=1)
-        if self.num_norm is not None:
-            num_feats = self.num_norm(num_feats)
-        x = torch.cat([ctx, num_feats], dim=1)
-        return self.mlp(x)
 
 
 class ProjectionHead(nn.Module):
@@ -556,6 +387,17 @@ def parse_int_list(value: Optional[str], default: Sequence[int]) -> List[int]:
     if not value:
         return list(default)
     return [int(part) for part in value.split(",") if part.strip()]
+
+
+def parse_col_list(value: Optional[str]) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    value = str(value).strip()
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
 
 
 def parse_json_dict(value) -> Dict:
@@ -726,10 +568,6 @@ def train_contrastive(
 
     for epoch in range(epochs):
         model.train()
-        if not finetune_backbone:
-            model.backbone.eval()
-            if model.projection is not None:
-                model.projection.eval()
         total_loss = 0.0
         total = 0
         for cat_ids, num_feats, labels in train_loader:
@@ -838,6 +676,74 @@ def train_classifier(
     return {"best_val_score": best_score}
 
 
+def train_joint(
+    model: ContrastivePipeline,
+    train_loader: DataLoader,
+    val_loader: Optional[DataLoader],
+    loss_fn: nn.Module,
+    miner: Optional[nn.Module],
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epochs: int,
+    use_amp: bool,
+    patience: int,
+    monitor_metric: str,
+    alpha: float,
+    beta: float,
+) -> Dict[str, float]:
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    ce_loss = nn.CrossEntropyLoss()
+    best_state = None
+    best_score = -float("inf")
+    patience_left = patience
+
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0.0
+        total = 0
+        for cat_ids, num_feats, labels in train_loader:
+            cat_ids = cat_ids.to(device)
+            num_feats = num_feats.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                _, _, metric, logits = model(cat_ids, num_feats)
+                if miner is not None:
+                    pairs = miner(metric, labels)
+                    cont_loss = loss_fn(metric, labels, pairs)
+                else:
+                    cont_loss = loss_fn(metric, labels)
+                cls_loss = ce_loss(logits, labels)
+                loss = alpha * cont_loss + beta * cls_loss
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.item() * len(labels)
+            total += len(labels)
+
+        train_loss = total_loss / max(total, 1)
+        msg = f"Epoch {epoch+1}/{epochs} | joint train loss={train_loss:.4f}"
+        if val_loader is not None:
+            metrics = evaluate_classifier(model, val_loader, device, use_amp)
+            score = metrics.get(monitor_metric, float("nan"))
+            msg += f" | val {monitor_metric}={score:.4f}"
+            if not math.isnan(score) and score > best_score:
+                best_score = score
+                best_state = copy.deepcopy(model.state_dict())
+                patience_left = patience
+            else:
+                patience_left -= 1
+        print(msg)
+
+        if val_loader is not None and patience > 0 and patience_left <= 0:
+            print("Early stopping (joint).")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return {"best_val_score": best_score}
+
+
 def parse_eval_specs(values: Optional[List[str]]) -> List[EvalSpec]:
     if not values:
         return []
@@ -857,37 +763,14 @@ def parse_eval_specs(values: Optional[List[str]]) -> List[EvalSpec]:
 
 def build_backbone(
     backbone_type: str,
-    cat_cardinalities: Sequence[int],
     numeric_dim: int,
     embedding_dim: int,
-    cat_embed_dim: int,
     hidden_dims: Sequence[int],
     dropout: float,
-    tf_d_model: int,
-    tf_heads: int,
-    tf_layers: int,
 ) -> nn.Module:
-    if backbone_type == "dense_mlp":
-        return DenseMLPBackbone(numeric_dim, hidden_dims, embedding_dim, dropout)
-    if backbone_type == "cat_mlp":
-        if not cat_cardinalities:
-            raise ValueError("cat_mlp requires categorical embeddings (cat_encoder=embedding).")
-        return CatMLPBackbone(cat_cardinalities, numeric_dim, cat_embed_dim, hidden_dims, embedding_dim, dropout)
-    if backbone_type == "cat_tf":
-        if not cat_cardinalities:
-            raise ValueError("cat_tf requires categorical embeddings (cat_encoder=embedding).")
-        return CatTransformerBackbone(
-            cat_cardinalities=cat_cardinalities,
-            numeric_dim=numeric_dim,
-            d_model=tf_d_model,
-            nhead=tf_heads,
-            num_layers=tf_layers,
-            hidden_dims=hidden_dims,
-            embedding_dim=embedding_dim,
-            dropout=dropout,
-            flatten=True,
-        )
-    raise ValueError(f"Unknown backbone_type: {backbone_type}")
+    if backbone_type != "dense_mlp":
+        raise ValueError("Numeric-only pipeline supports backbone_type='dense_mlp'.")
+    return DenseMLPBackbone(numeric_dim, hidden_dims, embedding_dim, dropout)
 
 
 def build_pipeline(
@@ -932,9 +815,7 @@ def run_experiment(args: argparse.Namespace, save_outputs: bool) -> Dict[str, Di
 
     preprocess_cfg = PreprocessConfig(
         num_scaler=args.num_scaler,
-        cat_encoder=args.cat_encoder,
         impute_strategy=args.impute_strategy,
-        add_availability_flags=not args.no_avail_flags,
     )
 
     data1_path = Path(args.data1)
@@ -947,19 +828,7 @@ def run_experiment(args: argparse.Namespace, save_outputs: bool) -> Dict[str, Di
         args.seed,
     )
 
-    df2 = y2 = None
-    if args.data2 and args.target2:
-        df2, y2 = load_raw_data(
-            Path(args.data2),
-            Path(args.target2),
-            args.target_col,
-            args.sample_size_data2,
-            args.seed,
-        )
-
-    df_train_raw, y_train_raw = mix_with_data2(
-        df1, y1, df2, y2, args.mix_percent, args.mix_base, args.seed
-    )
+    df_train_raw, y_train_raw = df1, y1
 
     y_all = y_train_raw.to_numpy(dtype=np.int64)
 
@@ -971,7 +840,11 @@ def run_experiment(args: argparse.Namespace, save_outputs: bool) -> Dict[str, Di
     val_df = df_train_raw.iloc[val_idx] if len(val_idx) else None
     test_df = df_train_raw.iloc[test_idx] if len(test_idx) else None
 
-    preprocessor = TabularPreprocessor(preprocess_cfg, NUMERIC_COLS, CAT_COLS).fit(train_df)
+    preprocessor = TabularPreprocessor(
+        preprocess_cfg,
+        numeric_cols=args.numeric_cols,
+        drop_cols=args.drop_cols,
+    ).fit(train_df)
     cat_train, num_train = preprocessor.transform(train_df)
     train_ds = TabularDataset(cat_train, num_train, y_all[train_idx])
 
@@ -1013,20 +886,12 @@ def run_experiment(args: argparse.Namespace, save_outputs: bool) -> Dict[str, Di
             drop_last=False,
         )
 
-    if args.cat_encoder == "onehot" and args.backbone_type != "dense_mlp":
-        raise ValueError("cat_encoder=onehot requires backbone_type=dense_mlp.")
-
     backbone = build_backbone(
         backbone_type=args.backbone_type,
-        cat_cardinalities=preprocessor.cat_cardinalities,
         numeric_dim=num_train.shape[1],
         embedding_dim=args.embedding_dim,
-        cat_embed_dim=args.cat_embed_dim,
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
-        tf_d_model=args.tf_d_model,
-        tf_heads=args.tf_heads,
-        tf_layers=args.tf_layers,
     )
     model = build_pipeline(
         backbone=backbone,
@@ -1221,21 +1086,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["separate", "joint"], default="joint")
     parser.add_argument("--data1", required=True)
     parser.add_argument("--target1", required=True)
-    parser.add_argument("--data2")
-    parser.add_argument("--target2")
     parser.add_argument("--target-col", default="class")
-    parser.add_argument("--mix-percent", type=float, default=0.0)
-    parser.add_argument("--mix-base", choices=["data1", "data2"], default="data2")
     parser.add_argument("--sample-size", type=int, default=-1)
-    parser.add_argument("--sample-size-data2", type=int, default=-1)
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--test-split", type=float, default=0.1)
     parser.add_argument("--eval", action="append", help="name:data_path:target_path or data_path:target_path")
 
     parser.add_argument("--num-scaler", choices=["none", "standard", "minmax"], default="none")
-    parser.add_argument("--cat-encoder", choices=["embedding", "onehot"], default="embedding")
     parser.add_argument("--impute-strategy", choices=["median", "zero"], default="median")
-    parser.add_argument("--no-avail-flags", action="store_true")
+    parser.add_argument(
+        "--numeric-cols",
+        default="",
+        help="Comma-separated list of numeric feature columns. Empty = use all columns.",
+    )
+    parser.add_argument(
+        "--drop-cols",
+        default="",
+        help="Comma-separated list of columns to drop before training.",
+    )
 
     parser.add_argument("--sampler", choices=["random", "m_per_class", "class_balanced"], default="random")
     parser.add_argument("--m-per-class", type=int, default=64)
@@ -1243,14 +1111,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drop-last", action="store_true")
     parser.add_argument("--num-workers", type=int, default=0)
 
-    parser.add_argument("--backbone-type", choices=["cat_mlp", "cat_tf", "dense_mlp"], default="cat_mlp")
+    parser.add_argument("--backbone-type", choices=["dense_mlp"], default="dense_mlp")
     parser.add_argument("--embedding-dim", type=int, default=128)
     parser.add_argument("--hidden-dims", default="512,256")
-    parser.add_argument("--cat-embed-dim", type=int, default=32)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--tf-d-model", type=int, default=64)
-    parser.add_argument("--tf-heads", type=int, default=4)
-    parser.add_argument("--tf-layers", type=int, default=2)
 
     parser.add_argument("--proj-dim", type=int, default=128)
     parser.add_argument("--proj-hidden", default="256")
@@ -1296,12 +1160,13 @@ def parse_args() -> argparse.Namespace:
     args.hidden_dims = parse_int_list(args.hidden_dims, [512, 256])
     args.proj_hidden = parse_int_list(args.proj_hidden, [256])
     args.clf_hidden = parse_int_list(args.clf_hidden, [256])
+    args.numeric_cols = parse_col_list(args.numeric_cols)
+    args.drop_cols = parse_col_list(args.drop_cols)
+    if not args.numeric_cols:
+        args.numeric_cols = None
     args.loss_params = parse_json_dict(args.loss_params)
     args.miner_params = parse_json_dict(args.miner_params)
     args.sample_size = None if args.sample_size is None or args.sample_size < 0 else args.sample_size
-    args.sample_size_data2 = (
-        None if args.sample_size_data2 is None or args.sample_size_data2 < 0 else args.sample_size_data2
-    )
 
     if args.run_name:
         run_name = args.run_name
@@ -1333,70 +1198,3 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-
-def train_joint(
-    model: ContrastivePipeline,
-    train_loader: DataLoader,
-    val_loader: Optional[DataLoader],
-    loss_fn: nn.Module,
-    miner: Optional[nn.Module],
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    epochs: int,
-    use_amp: bool,
-    patience: int,
-    monitor_metric: str,
-    alpha: float,
-    beta: float,
-) -> Dict[str, float]:
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-    ce_loss = nn.CrossEntropyLoss()
-    best_state = None
-    best_score = -float("inf")
-    patience_left = patience
-
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0.0
-        total = 0
-        for cat_ids, num_feats, labels in train_loader:
-            cat_ids = cat_ids.to(device)
-            num_feats = num_feats.to(device)
-            labels = labels.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                _, _, metric, logits = model(cat_ids, num_feats)
-                if miner is not None:
-                    pairs = miner(metric, labels)
-                    cont_loss = loss_fn(metric, labels, pairs)
-                else:
-                    cont_loss = loss_fn(metric, labels)
-                cls_loss = ce_loss(logits, labels)
-                loss = alpha * cont_loss + beta * cls_loss
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            total_loss += loss.item() * len(labels)
-            total += len(labels)
-
-        train_loss = total_loss / max(total, 1)
-        msg = f"Epoch {epoch+1}/{epochs} | joint train loss={train_loss:.4f}"
-        if val_loader is not None:
-            metrics = evaluate_classifier(model, val_loader, device, use_amp)
-            score = metrics.get(monitor_metric, float("nan"))
-            msg += f" | val {monitor_metric}={score:.4f}"
-            if not math.isnan(score) and score > best_score:
-                best_score = score
-                best_state = copy.deepcopy(model.state_dict())
-                patience_left = patience
-            else:
-                patience_left -= 1
-        print(msg)
-
-        if val_loader is not None and patience > 0 and patience_left <= 0:
-            print("Early stopping (joint).")
-            break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    return {"best_val_score": best_score}

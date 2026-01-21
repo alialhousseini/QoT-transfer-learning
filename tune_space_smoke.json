@@ -1,0 +1,21 @@
+{
+  "mode": ["joint"],
+  "num_scaler": ["none", "standard"],
+  "impute_strategy": ["median"],
+  "sampler": ["random"],
+  "batch_size": [128],
+  "embedding_dim": [64, 128],
+  "hidden_dims": [[256, 128]],
+  "dropout": [0.1],
+  "proj_dim": [64],
+  "proj_hidden": [[128]],
+  "proj_dropout": [0.1],
+  "metric_from": ["projection"],
+  "clf_hidden": [[128]],
+  "clf_dropout": [0.2],
+  "loss_name": ["TripletMarginLoss"],
+  "miner_name": [null],
+  "lr": [0.001],
+  "epochs": [1],
+  "patience": [2]
+}
