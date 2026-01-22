@@ -1,5 +1,5 @@
 {
-  "mode": ["separate"],
+  "mode": ["joint"],
   "data1": ["datasets/cleaned_lightpath_dataset.csv"],
   "target1": ["datasets/cleaned_lightpath_target.csv"],
   "target_col": ["class"],
@@ -39,16 +39,16 @@
   "monitor_metric": ["pr_auc", "f1", "roc_auc"],
   "finetune_backbone": [false],
   "amp": [false],
-  "sample_size": [350000],
+  "sample_size": [1000],
   "val_split": [0.1],
   "test_split": [0.1],
   "seed": [123],
   "save_dir": ["runs"],
   "run_name": [""],
   "tune": [true],
-  "tune_space": ["tune_space_full_sep.json"],
+  "tune_space": ["tune_space_full.json"],
   "tune_trials": [10],
-  "tune_method": ["grid"],
+  "tune_method": ["randomd"],
   "tune_metric": ["f1"],
   "tune_epochs": [0]
 }

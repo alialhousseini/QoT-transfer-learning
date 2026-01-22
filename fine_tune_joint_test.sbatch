@@ -1,11 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name="qot-tuning-sep"
+#SBATCH --job-name="qot-tuning"
 #SBATCH --partition=gpu
 #SBATCH --time 1-00:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --mem=64G
-#SBATCH -o 'outfile_tune_sep.txt'
-#SBATCH -e 'error_tune_sep.txt'
+#SBATCH -o 'outfile_tune_test.txt'
+#SBATCH -e 'error_tune_test.txt'
 
 set -euo pipefail
 
@@ -50,12 +49,12 @@ cd "$WORKDIR"
 
 # Use stdbuf to ensure line-buffered output so `tee` updates in real time
 stdbuf -oL -eL python -u separate_training.py \
-  --mode separate \
+  --mode joint \
   --data1 datasets/cleaned_lightpath_dataset.csv \
   --target1 datasets/cleaned_lightpath_target.csv \
   --device cuda \
   --tune \
-  --tune-space tune_space_full_sep.json \
+  --tune-space tune_space_full_test.json \
   2>&1 | tee -a "$LOGFILE"
 
 # Deactivate virtualenv if active

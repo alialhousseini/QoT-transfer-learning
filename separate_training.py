@@ -1071,7 +1071,13 @@ def load_search_space(path: Path) -> Dict[str, List]:
         space = json.load(f)
     if not isinstance(space, dict):
         raise ValueError("Search space JSON must be a dict of parameter -> list.")
-    return space
+    normalized: Dict[str, List] = {}
+    for key, value in space.items():
+        if isinstance(value, list):
+            normalized[key] = value
+        else:
+            normalized[key] = [value]
+    return normalized
 
 
 def sample_from_space(space: Dict[str, List]) -> Dict[str, object]:
@@ -1096,8 +1102,47 @@ def apply_overrides(args: argparse.Namespace, overrides: Dict[str, object]) -> a
     return new_args
 
 
+def _extract_tune_controls(
+    args: argparse.Namespace,
+    space: Dict[str, List],
+) -> Tuple[argparse.Namespace, Dict[str, List]]:
+    """Extract tune control keys from space and let them override CLI args."""
+    meta_keys = {
+        "tune_method",
+        "tune_trials",
+        "tune_metric",
+        "tune_epochs",
+    }
+    new_args = copy.deepcopy(args)
+    remaining = {}
+
+    def _first_value(value):
+        if isinstance(value, list):
+            if not value:
+                return None
+            if len(value) > 1:
+                raise ValueError(
+                    "Tune control keys must have a single value in the JSON (got multiple)."
+                )
+            return value[0]
+        return value
+
+    for key, value in space.items():
+        if key in meta_keys:
+            resolved = _first_value(value)
+            if resolved is not None:
+                if not hasattr(new_args, key):
+                    raise ValueError(f"Unknown tune control parameter: {key}")
+                setattr(new_args, key, resolved)
+        else:
+            remaining[key] = value
+
+    return new_args, remaining
+
+
 def run_tuning(args: argparse.Namespace) -> None:
     space = load_search_space(Path(args.tune_space))
+    args, space = _extract_tune_controls(args, space)
     trials = args.tune_trials
     metric = args.tune_metric
     best_score = -float("inf")

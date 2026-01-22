@@ -39,7 +39,7 @@
   "monitor_metric": ["pr_auc", "f1", "roc_auc"],
   "finetune_backbone": [false],
   "amp": [false],
-  "sample_size": [1000],
+  "sample_size": [350000],
   "val_split": [0.1],
   "test_split": [0.1],
   "seed": [123],
@@ -47,7 +47,7 @@
   "run_name": [""],
   "tune": [true],
   "tune_space": ["tune_space_full.json"],
-  "tune_trials": [10],
+  "tune_trials": [20],
   "tune_method": ["random"],
   "tune_metric": ["f1"],
   "tune_epochs": [0]

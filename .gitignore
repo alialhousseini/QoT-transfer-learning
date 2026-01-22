@@ -17,3 +17,7 @@ datasets/
 datasets/*.csv
 runs/
 logs/
+.venv/
+error_*.txt
+outfile_*.txt
+tmp/
