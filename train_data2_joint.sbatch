@@ -1,10 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name="qot-tuning"
-#SBATCH --partition=gpu
+#SBATCH --job-name="train-data2-joint"
+#SBATCH --partition=gpuISIN_HIGH
 #SBATCH --time 1-00:00:00
 #SBATCH --gres=gpu:1
-#SBATCH -o 'outfile_tune.txt'
-#SBATCH -e 'error_tune.txt'
+#SBATCH --array=0-95%4
+#SBATCH -o 'outfile_train_data2_joint.txt'
+#SBATCH -e 'error_train_data2_joint.txt'
 
 set -euo pipefail
 
@@ -12,10 +13,11 @@ set -euo pipefail
 export PYTHONUNBUFFERED=1
 
 JOB_ID=${SLURM_JOB_ID:-$$}
+TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
 WORKDIR=${SLURM_SUBMIT_DIR:-$(pwd)}
 LOGDIR="$WORKDIR/logs"
 mkdir -p "$LOGDIR"
-LOGFILE="$LOGDIR/tune_${JOB_ID}.log"
+LOGFILE="$LOGDIR/train_${JOB_ID}_${TASK_ID}.log"
 
 # Set TMPDIR to a directory in scratch to avoid filling up /tmp on the node
 export TMPDIR="$WORKDIR/tmp"
@@ -44,17 +46,26 @@ else
   source "$VENV_DIR/bin/activate"
 fi
 
-echo "Starting tuning — streaming logs to stdout and $LOGFILE"
+echo "Starting training — streaming logs to stdout and $LOGFILE"
 cd "$WORKDIR"
+
+CONFIG_DIR="$WORKDIR/configs_data2"
+CONFIG_FILE="$CONFIG_DIR/run_${TASK_ID}.json"
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo "Config not found for array task $TASK_ID: $CONFIG_FILE" >&2
+  echo "Expected configs named: $CONFIG_DIR/run_<ARRAY_ID>.json" >&2
+  exit 1
+fi
+
+RUN_TAG="data2_array${TASK_ID}_$(basename "$CONFIG_FILE" .json)"
+SAVE_DIR="$WORKDIR/runs_data2/array_${TASK_ID}"
+mkdir -p "$SAVE_DIR"
 
 # Use stdbuf to ensure line-buffered output so `tee` updates in real time
 stdbuf -oL -eL python -u separate_training.py \
-  --mode joint \
-  --data1 datasets/cleaned_lightpath_dataset.csv \
-  --target1 datasets/cleaned_lightpath_target.csv \
-  --device cuda \
-  --tune \
-  --tune-space tune_space_full.json \
+  --config "$CONFIG_FILE" \
+  --run-name "$RUN_TAG" \
+  --save-dir "$SAVE_DIR" \
   2>&1 | tee -a "$LOGFILE"
 
 # Deactivate virtualenv if active

@@ -10,6 +10,7 @@ Pipeline blocks:
 Supports:
 - Separate training: contrastive (backbone+projection) then classifier.
 - Joint training: optimize contrastive + classification losses together.
+- Optional fine-tuning: after initial training, continue supervised training on a second dataset.
 - Hyperparameter tuning via random/grid search over a JSON search space.
 
 Example:
@@ -37,6 +38,7 @@ import itertools
 import json
 import math
 import random
+import sys
 import time
 import traceback
 from dataclasses import dataclass
@@ -57,6 +59,7 @@ from sklearn.metrics import (
     f1_score,
     precision_score,
     recall_score,
+    precision_recall_fscore_support,
     average_precision_score,
     roc_auc_score,
 )
@@ -487,7 +490,20 @@ def compute_metrics(y_true: np.ndarray, y_prob: np.ndarray) -> Dict[str, float]:
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "f1": f1_score(y_true, y_pred, zero_division=0),
+        "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
+        "f1_weighted": f1_score(y_true, y_pred, average="weighted", zero_division=0),
     }
+    per_prec, per_rec, _, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        labels=[0, 1],
+        average=None,
+        zero_division=0,
+    )
+    metrics["precision_0"] = float(per_prec[0])
+    metrics["recall_0"] = float(per_rec[0])
+    metrics["precision_1"] = float(per_prec[1])
+    metrics["recall_1"] = float(per_rec[1])
     try:
         metrics["pr_auc"] = average_precision_score(y_true, y_prob)
     except Exception:
@@ -656,12 +672,7 @@ def train_classifier(
     best_score = -float("inf")
     patience_left = patience
 
-    if not finetune_backbone:
-        for param in model.backbone.parameters():
-            param.requires_grad = False
-        if model.projection is not None:
-            for param in model.projection.parameters():
-                param.requires_grad = False
+    set_backbone_trainable(model, finetune_backbone)
 
     for epoch in range(epochs):
         model.train()
@@ -781,10 +792,14 @@ def train_joint(
 
 
 def parse_eval_specs(values: Optional[List[str]]) -> List[EvalSpec]:
-    if not values:
+    if values is None or values == "":
         return []
+    if isinstance(values, str):
+        values = [values]
     specs: List[EvalSpec] = []
     for raw in values:
+        if raw is None or raw == "":
+            continue
         parts = raw.split(":")
         if len(parts) == 3:
             name, data_path, target_path = parts
@@ -832,6 +847,80 @@ def build_pipeline(
     return ContrastivePipeline(backbone, projection, classifier, metric_from, normalize_embeddings)
 
 
+def set_backbone_trainable(model: ContrastivePipeline, trainable: bool) -> None:
+    for param in model.backbone.parameters():
+        param.requires_grad = trainable
+    if model.projection is not None:
+        for param in model.projection.parameters():
+            param.requires_grad = trainable
+
+
+def build_split_loaders(
+    df: pd.DataFrame,
+    y: pd.Series,
+    preprocessor: TabularPreprocessor,
+    args: argparse.Namespace,
+    val_split: float,
+    test_split: float,
+    seed: int,
+    fit_preprocessor: bool,
+) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader], np.ndarray]:
+    y_all = y.to_numpy(dtype=np.int64)
+    train_idx, val_idx, test_idx = split_indices(y_all, val_split, test_split, seed)
+
+    train_df = df.iloc[train_idx]
+    val_df = df.iloc[val_idx] if len(val_idx) else None
+    test_df = df.iloc[test_idx] if len(test_idx) else None
+
+    if fit_preprocessor:
+        preprocessor.fit(train_df)
+
+    cat_train, num_train = preprocessor.transform(train_df)
+    train_ds = TabularDataset(cat_train, num_train, y_all[train_idx])
+
+    val_ds = None
+    if val_df is not None:
+        cat_val, num_val = preprocessor.transform(val_df)
+        val_ds = TabularDataset(cat_val, num_val, y_all[val_idx])
+
+    test_ds = None
+    if test_df is not None:
+        cat_test, num_test = preprocessor.transform(test_df)
+        test_ds = TabularDataset(cat_test, num_test, y_all[test_idx])
+
+    train_loader = build_dataloader(
+        train_ds,
+        batch_size=args.batch_size,
+        sampler_type=args.sampler,
+        m_per_class=args.m_per_class,
+        seed=seed,
+        num_workers=args.num_workers,
+        drop_last=args.drop_last,
+    )
+
+    val_loader = None
+    if val_ds is not None:
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            drop_last=False,
+        )
+
+    test_loader = None
+    if test_ds is not None:
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            drop_last=False,
+        )
+
+    return train_loader, val_loader, test_loader, num_train
+
+
 def serialize_args(args: argparse.Namespace) -> Dict:
     payload = {}
     for key, value in vars(args).items():
@@ -864,63 +953,21 @@ def run_experiment(args: argparse.Namespace, save_outputs: bool) -> Dict[str, Di
         args.seed,
     )
 
-    df_train_raw, y_train_raw = df1, y1
-
-    y_all = y_train_raw.to_numpy(dtype=np.int64)
-
-    train_idx, val_idx, test_idx = split_indices(
-        y_all, args.val_split, args.test_split, args.seed
-    )
-
-    train_df = df_train_raw.iloc[train_idx]
-    val_df = df_train_raw.iloc[val_idx] if len(val_idx) else None
-    test_df = df_train_raw.iloc[test_idx] if len(test_idx) else None
-
     preprocessor = TabularPreprocessor(
         preprocess_cfg,
         numeric_cols=args.numeric_cols,
         drop_cols=args.drop_cols,
-    ).fit(train_df)
-    cat_train, num_train = preprocessor.transform(train_df)
-    train_ds = TabularDataset(cat_train, num_train, y_all[train_idx])
-
-    val_ds = None
-    if val_df is not None:
-        cat_val, num_val = preprocessor.transform(val_df)
-        val_ds = TabularDataset(cat_val, num_val, y_all[val_idx])
-
-    test_ds = None
-    if test_df is not None:
-        cat_test, num_test = preprocessor.transform(test_df)
-        test_ds = TabularDataset(cat_test, num_test, y_all[test_idx])
-
-    train_loader = build_dataloader(
-        train_ds,
-        batch_size=args.batch_size,
-        sampler_type=args.sampler,
-        m_per_class=args.m_per_class,
-        seed=args.seed,
-        num_workers=args.num_workers,
-        drop_last=args.drop_last,
     )
-    val_loader = None
-    if val_ds is not None:
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            drop_last=False,
-        )
-    test_loader = None
-    if test_ds is not None:
-        test_loader = DataLoader(
-            test_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            drop_last=False,
-        )
+    train_loader, val_loader, test_loader, num_train = build_split_loaders(
+        df1,
+        y1,
+        preprocessor,
+        args,
+        args.val_split,
+        args.test_split,
+        args.seed,
+        fit_preprocessor=True,
+    )
 
     backbone = build_backbone(
         backbone_type=args.backbone_type,
@@ -961,7 +1008,7 @@ def run_experiment(args: argparse.Namespace, save_outputs: bool) -> Dict[str, Di
     miner = move_module_to_device(build_pml_miner(args.miner_name, args.miner_params), device)
     loss_params = get_trainable_params(loss_fn)
 
-    results: Dict[str, Dict] = {"train": {}, "val": {}, "test": {}, "eval": {}}
+    results: Dict[str, Dict] = {"train": {}, "val": {}, "test": {}, "eval": {}, "finetune": {}}
 
     if args.mode == "separate":
         contrastive_params = list(model.backbone.parameters())
@@ -1056,6 +1103,72 @@ def run_experiment(args: argparse.Namespace, save_outputs: bool) -> Dict[str, Di
             drop_last=False,
         )
         results["eval"][spec.name] = evaluate_classifier(model, eval_loader, device, use_amp)
+
+    if args.finetune_data or args.finetune_target:
+        if not (args.finetune_data and args.finetune_target):
+            raise ValueError("Both --finetune-data and --finetune-target are required for fine-tuning.")
+
+        df2, y2 = load_raw_data(
+            Path(args.finetune_data),
+            Path(args.finetune_target),
+            args.target_col,
+            args.finetune_sample_size,
+            args.seed,
+        )
+        ft_train_loader, ft_val_loader, ft_test_loader, _ = build_split_loaders(
+            df2,
+            y2,
+            preprocessor,
+            args,
+            args.finetune_val_split,
+            args.finetune_test_split,
+            args.seed,
+            fit_preprocessor=False,
+        )
+
+        finetune_optimizer = torch.optim.AdamW(
+            list(model.classifier.parameters())
+            + (list(model.backbone.parameters()) if args.finetune_backbone else []),
+            lr=args.finetune_lr,
+            weight_decay=args.finetune_weight_decay,
+        )
+        results["finetune"]["classifier"] = train_classifier(
+            model,
+            ft_train_loader,
+            ft_val_loader,
+            finetune_optimizer,
+            device,
+            args.finetune_epochs,
+            use_amp,
+            args.patience,
+            args.monitor_metric,
+            args.finetune_backbone,
+        )
+        if save_outputs:
+            torch.save(model.state_dict(), args.output_dir / f"{args.run_name}_finetune.pt")
+
+        if ft_val_loader is not None:
+            results["finetune"]["val"] = evaluate_classifier(model, ft_val_loader, device, use_amp)
+        if ft_test_loader is not None:
+            results["finetune"]["test"] = evaluate_classifier(model, ft_test_loader, device, use_amp)
+
+        results["finetune"]["eval"] = {}
+        for spec in eval_specs:
+            eval_df, eval_y = load_raw_data(
+                spec.data_path, spec.target_path, args.target_col, None, args.seed
+            )
+            cat_eval, num_eval = preprocessor.transform(eval_df)
+            eval_ds = TabularDataset(cat_eval, num_eval, eval_y.to_numpy(dtype=np.int64))
+            eval_loader = DataLoader(
+                eval_ds,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.num_workers,
+                drop_last=False,
+            )
+            results["finetune"]["eval"][spec.name] = evaluate_classifier(
+                model, eval_loader, device, use_amp
+            )
 
     if save_outputs:
         with open(args.output_dir / f"{args.run_name}_metrics.json", "w", encoding="utf-8") as f:
@@ -1186,9 +1299,10 @@ def run_tuning(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="QoT contrastive + classifier training")
+    parser.add_argument("--config", default="")
     parser.add_argument("--mode", choices=["separate", "joint"], default="joint")
-    parser.add_argument("--data1", required=True)
-    parser.add_argument("--target1", required=True)
+    parser.add_argument("--data1", default="")
+    parser.add_argument("--target1", default="")
     parser.add_argument("--target-col", default="class")
     parser.add_argument("--sample-size", type=int, default=-1)
     parser.add_argument("--val-split", type=float, default=0.1)
@@ -1247,6 +1361,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--finetune-backbone", action="store_true")
     parser.add_argument("--amp", action="store_true")
 
+    parser.add_argument("--finetune-data", default="")
+    parser.add_argument("--finetune-target", default="")
+    parser.add_argument("--finetune-sample-size", type=int, default=-1)
+    parser.add_argument("--finetune-val-split", type=float, default=None)
+    parser.add_argument("--finetune-test-split", type=float, default=None)
+    parser.add_argument("--finetune-epochs", type=int, default=None)
+    parser.add_argument("--finetune-lr", type=float, default=None)
+    parser.add_argument("--finetune-weight-decay", type=float, default=None)
+
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-dir", default="runs")
@@ -1260,6 +1383,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tune-epochs", type=int, default=0)
 
     args = parser.parse_args()
+    cli_values = vars(args).copy()
+
+    if args.config:
+        config_path = Path(args.config)
+        if not config_path.exists():
+            raise ValueError(f"--config path not found: {config_path}")
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+        if not isinstance(config_data, dict):
+            raise ValueError("--config must point to a JSON object of argument overrides.")
+        for key, value in config_data.items():
+            if not hasattr(args, key):
+                raise ValueError(f"Unknown config parameter: {key}")
+            setattr(args, key, value)
+        provided_dests = set()
+        argv = sys.argv[1:]
+        for arg in argv:
+            if not arg.startswith("--"):
+                continue
+            opt = arg.split("=", 1)[0]
+            action = parser._option_string_actions.get(opt)
+            if action is not None:
+                provided_dests.add(action.dest)
+        for dest in provided_dests:
+            setattr(args, dest, cli_values[dest])
 
     args.hidden_dims = parse_int_list(args.hidden_dims, [512, 256])
     args.proj_hidden = parse_int_list(args.proj_hidden, [256])
@@ -1271,6 +1419,26 @@ def parse_args() -> argparse.Namespace:
     args.loss_params = parse_json_dict(args.loss_params)
     args.miner_params = parse_json_dict(args.miner_params)
     args.sample_size = None if args.sample_size is None or args.sample_size < 0 else args.sample_size
+    args.finetune_sample_size = (
+        None
+        if args.finetune_sample_size is None or args.finetune_sample_size < 0
+        else args.finetune_sample_size
+    )
+    args.finetune_data = args.finetune_data or None
+    args.finetune_target = args.finetune_target or None
+    if args.finetune_val_split is None:
+        args.finetune_val_split = args.val_split
+    if args.finetune_test_split is None:
+        args.finetune_test_split = args.test_split
+    if args.finetune_epochs is None:
+        args.finetune_epochs = args.classifier_epochs
+    if args.finetune_lr is None:
+        args.finetune_lr = args.lr
+    if args.finetune_weight_decay is None:
+        args.finetune_weight_decay = args.weight_decay
+
+    if not args.data1 or not args.target1:
+        raise ValueError("--data1 and --target1 are required (via CLI or --config).")
 
     if args.run_name:
         run_name = args.run_name
@@ -1297,8 +1465,10 @@ def main() -> None:
     if results.get("eval"):
         print("Eval metrics:")
         print(json.dumps(results["eval"], indent=2))
+    if results.get("finetune", {}).get("eval"):
+        print("Fine-tune eval metrics:")
+        print(json.dumps(results["finetune"]["eval"], indent=2))
 
 
 if __name__ == "__main__":
     main()
-

@@ -15,7 +15,6 @@ __pycache__/
 *.pyc
 datasets/
 datasets/*.csv
-runs/
 logs/
 .venv/
 error_*.txt
