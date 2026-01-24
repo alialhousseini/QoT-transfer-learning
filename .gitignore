@@ -20,3 +20,13 @@ logs/
 error_*.txt
 outfile_*.txt
 tmp/
+*.log
+config_sep1/
+config_sep2/
+configs/
+configs_data2/
+runs/
+runs_data2/
+runs_data1/
+runs_data1sep/
+runs_data2sep/
